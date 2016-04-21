@@ -90,6 +90,37 @@ static int _fb_nand_erase(nand_info_t *nand, struct part_info *part)
 	return 0;
 }
 
+static int _fb_nand_raw_write(nand_info_t *nand, unsigned int offset,
+			      void *buffer, unsigned int length)
+{
+	unsigned int page_count;
+	int ret, i;
+
+	page_count = length / nand->writesize;
+
+	for (i = 0; i < page_count; i++) {
+		mtd_oob_ops_t ops = {
+			.datbuf = (u8 *)buffer,
+			.oobbuf = ((u8 *)buffer) + nand->writesize,
+			.len = nand->writesize,
+			.ooblen = nand->oobsize,
+			.mode = MTD_OPS_RAW
+		};
+
+		ret = mtd_write_oob(nand, offset, &ops);
+		if (ret) {
+			printf("%s: error at offset %llx, ret %d\n",
+			       __func__, (long long)offset, ret);
+			break;
+		}
+
+		buffer += nand->writesize + nand->oobsize;
+		offset += nand->writesize;
+	}
+
+	return 0;
+}
+
 static int _fb_nand_write(nand_info_t *nand, struct part_info *part,
 			  void *buffer, unsigned int offset,
 			  unsigned int length, size_t *written)
@@ -100,6 +131,11 @@ static int _fb_nand_write(nand_info_t *nand, struct part_info *part,
 	flags |= WITH_DROP_FFS;
 #endif
 
+	if (!strcmp(part->name, "spl") || !strcmp(part->name, "spl-backup")) {
+		*written = length;
+		return _fb_nand_raw_write(nand, offset, buffer, length);
+	}
+
 	return nand_write_skip_bad(nand, offset, &length, written,
 				   part->size - (offset - part->offset),
 				   buffer, flags);
@@ -109,21 +145,34 @@ static int fb_nand_sparse_write(struct sparse_storage *storage,
 				void *priv,
 				unsigned int offset,
 				unsigned int size,
-				char *data)
+				char *data,
+				unsigned int *new_offset)
 {
+	u64 ofs = (u64)offset * storage->block_sz;
 	struct fb_nand_sparse *sparse = priv;
-	size_t written;
+	unsigned int nblocks = 0, i;
 	int ret;
 
-	ret = _fb_nand_write(sparse->nand, sparse->part, data,
-			     offset * storage->block_sz,
-			     size * storage->block_sz, &written);
-	if (ret < 0) {
-		printf("Failed to write sparse chunk\n");
-		return ret;
+	printf("Writing at offset 0x%llx\n", ofs);
+
+	for (i = 0; i < size; i++) {
+		size_t used;
+
+		ret = _fb_nand_write(sparse->nand, sparse->part,
+				     data + (storage->block_sz * i),
+				     ofs, storage->block_sz, &used);
+		if (ret < 0) {
+			printf("Failed to write sparse chunk\n");
+			return ret;
+		}
+		ofs += used;
+		nblocks += used / storage->block_sz;
 	}
 
-	return written / storage->block_sz;
+	printf("New offset 0x%llx\n", ofs);
+
+	*new_offset = offset + nblocks;
+	return size;
 }
 
 void fb_nand_flash_write(const char *partname, unsigned int session_id,
@@ -156,8 +205,8 @@ void fb_nand_flash_write(const char *partname, unsigned int session_id,
 		sparse_priv.part = part;
 
 		sparse.block_sz = nand->writesize;
-		sparse.start = part->offset / sparse.block_sz;
-		sparse.size = part->size  / sparse.block_sz;
+		sparse.start = lldiv(part->offset, sparse.block_sz);
+		sparse.size = lldiv(part->size, sparse.block_sz);
 		sparse.name = part->name;
 		sparse.write = fb_nand_sparse_write;
 
